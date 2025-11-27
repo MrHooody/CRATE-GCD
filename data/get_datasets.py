@@ -1,11 +1,13 @@
-from data.data_utils import MergedDataset
+from data.data_utils import MergedDataset, MergedTriDataset
+from data.domainnet import get_domainnet_datasets
+from data.cubc import get_cubc_datasets
+from data.scarsc import get_scarsc_datasets
+from data.fgvcc import get_fgvcc_datasets
 
-from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets
-from data.herbarium_19 import get_herbarium_datasets
-from data.stanford_cars import get_scars_datasets
-from data.imagenet import get_imagenet_100_datasets, get_imagenet_1k_datasets
-from data.cub import get_cub_datasets
-from data.fgvc_aircraft import get_aircraft_datasets
+from data.domainnet import subsample_classes as subsample_dataset_domainnet
+from data.cubc import subsample_classes as subsample_dataset_cubc
+from data.scarsc import subsample_classes as subsample_dataset_scarsc
+from data.fgvcc import subsample_classes as subsample_dataset_fgvcc
 
 from copy import deepcopy
 import pickle
@@ -13,16 +15,18 @@ import os
 
 from config import osr_split_dir
 
+sub_sample_class_funcs = {
+    'domainnet': subsample_dataset_domainnet,
+    'cubc': subsample_dataset_cubc,
+    'fgvcc': subsample_dataset_fgvcc,
+    'scarsc': subsample_dataset_scarsc
+}
 
 get_dataset_funcs = {
-    'cifar10': get_cifar_10_datasets,
-    'cifar100': get_cifar_100_datasets,
-    'imagenet_100': get_imagenet_100_datasets,
-    'imagenet_1k': get_imagenet_1k_datasets,
-    'herbarium_19': get_herbarium_datasets,
-    'cub': get_cub_datasets,
-    'aircraft': get_aircraft_datasets,
-    'scars': get_scars_datasets
+    'domainnet': get_domainnet_datasets,
+    'cubc': get_cubc_datasets,
+    'fgvcc': get_fgvcc_datasets,
+    'scarsc': get_scarsc_datasets
 }
 
 
@@ -44,7 +48,8 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
     datasets = get_dataset_f(train_transform=train_transform, test_transform=test_transform,
                             train_classes=args.train_classes,
                             prop_train_labels=args.prop_train_labels,
-                            split_train_val=False)
+                            args=args)
+
     # Set target transforms:
     target_transform_dict = {}
     for i, cls in enumerate(list(args.train_classes) + list(args.unlabeled_classes)):
@@ -55,65 +60,71 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
         if dataset is not None:
             dataset.target_transform = target_transform
 
-    # Train split (labelled and unlabelled classes) for training
-    train_dataset = MergedDataset(labelled_dataset=deepcopy(datasets['train_labelled']),
-                                  unlabelled_dataset=deepcopy(datasets['train_unlabelled']))
+    if args.only_test:
+        return datasets['test']
 
-    test_dataset = datasets['test']
-    unlabelled_train_examples_test = deepcopy(datasets['train_unlabelled'])
-    unlabelled_train_examples_test.transform = test_transform
+    if args.task_type == 'A_L+A_U->B':
+        # Train split (labelled and unlabelled classes) for training
+        train_dataset = MergedDataset(labelled_dataset=deepcopy(datasets['train_labelled']),
+                                    unlabelled_dataset=deepcopy(datasets['trainA_unlabelled']))
 
-    return train_dataset, test_dataset, unlabelled_train_examples_test, datasets
+        unlabelled_train_examples_test = deepcopy(datasets['trainA_unlabelled'])
+        unlabelled_train_examples_test.transform = test_transform
 
+        return train_dataset, unlabelled_train_examples_test, datasets
+    
+    elif args.task_type == 'A_L+A_U+B->A_U+B+C':
+        train_dataset = MergedTriDataset(labelled_dataset=deepcopy(datasets['train_labelled']),
+                                        unlabelled_dataset1=deepcopy(datasets['trainA_unlabelled']),
+                                        unlabelled_dataset2=deepcopy(datasets['trainB_unlabelled']))
+
+        unlabelled_trainA_test = deepcopy(datasets['trainA_unlabelled'])
+        unlabelled_trainA_test.transform = test_transform
+        unlabelled_trainB_test = datasets['testB']
+
+        return train_dataset, unlabelled_trainA_test, unlabelled_trainB_test, datasets
+    
+    else:
+        raise NotImplementedError
+        
 
 def get_class_splits(args):
-
-    # For FGVC datasets, optionally return bespoke splits
-    if args.dataset_name in ('scars', 'cub', 'aircraft'):
+    if args.dataset_name in ('cubc', 'scarsc', 'fgvcc'):
         if hasattr(args, 'use_ssb_splits'):
             use_ssb_splits = args.use_ssb_splits
         else:
             use_ssb_splits = False
 
-    # -------------
-    # GET CLASS SPLITS
-    # -------------
-    if args.dataset_name == 'cifar10':
+    if args.dataset_name == 'domainnet':
+        args.image_size = 224
+        
+        if args.pre_splits:
+            split_path = os.path.join(osr_split_dir, 'domainnet_splits.pkl')
+            with open(split_path, 'rb') as handle:
+                class_info = pickle.load(handle)
 
-        args.image_size = 32
-        args.train_classes = range(5)
-        args.unlabeled_classes = range(5, 10)
+            args.train_classes = class_info['known_classes']
+            open_set_classes = class_info['unknown_classes']
+            args.unlabeled_classes = open_set_classes['Hard'] + open_set_classes['Medium'] + open_set_classes['Easy']
 
-    elif args.dataset_name == 'cifar100':
+        else:
+            args.train_classes = range(173)
+            args.unlabeled_classes = range(173, 345)
 
-        args.image_size = 32
-        args.train_classes = range(80)
-        args.unlabeled_classes = range(80, 100)
-
-    elif args.dataset_name == 'herbarium_19':
+    elif args.dataset_name == 'cubc':
 
         args.image_size = 224
-        herb_path_splits = os.path.join(osr_split_dir, 'herbarium_19_class_splits.pkl')
 
-        with open(herb_path_splits, 'rb') as handle:
-            class_splits = pickle.load(handle)
+        if use_ssb_splits:
+            split_path = os.path.join(osr_split_dir, 'cub_osr_splits.pkl')
+            with open(split_path, 'rb') as handle:
+                class_info = pickle.load(handle)
 
-        args.train_classes = class_splits['Old']
-        args.unlabeled_classes = class_splits['New']
+            args.train_classes = class_info['known_classes']
+            open_set_classes = class_info['unknown_classes']
+            args.unlabeled_classes = open_set_classes['Hard'] + open_set_classes['Medium'] + open_set_classes['Easy']
 
-    elif args.dataset_name == 'imagenet_100':
-
-        args.image_size = 224
-        args.train_classes = range(50)
-        args.unlabeled_classes = range(50, 100)
-
-    elif args.dataset_name == 'imagenet_1k':
-
-        args.image_size = 224
-        args.train_classes = range(500)
-        args.unlabeled_classes = range(500, 1000)
-    
-    elif args.dataset_name == 'scars':
+    elif args.dataset_name == 'scarsc':
 
         args.image_size = 224
 
@@ -132,7 +143,7 @@ def get_class_splits(args):
             args.train_classes = range(98)
             args.unlabeled_classes = range(98, 196)
 
-    elif args.dataset_name == 'aircraft':
+    elif args.dataset_name == 'fgvcc':
 
         args.image_size = 224
         if use_ssb_splits:
@@ -150,27 +161,7 @@ def get_class_splits(args):
             args.train_classes = range(50)
             args.unlabeled_classes = range(50, 100)
 
-    elif args.dataset_name == 'cub':
-
-        args.image_size = 224
-
-        if use_ssb_splits:
-
-            split_path = os.path.join(osr_split_dir, 'cub_osr_splits.pkl')
-            with open(split_path, 'rb') as handle:
-                class_info = pickle.load(handle)
-
-            args.train_classes = class_info['known_classes']
-            open_set_classes = class_info['unknown_classes']
-            args.unlabeled_classes = open_set_classes['Hard'] + open_set_classes['Medium'] + open_set_classes['Easy']
-
-        else:
-
-            args.train_classes = range(100)
-            args.unlabeled_classes = range(100, 200)
-
     else:
-
         raise NotImplementedError
 
     return args
