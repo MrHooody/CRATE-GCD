@@ -1,6 +1,7 @@
 import os
 import torch
 import inspect
+import argparse
 
 from datetime import datetime
 from loguru import logger
@@ -68,8 +69,7 @@ def init_experiment(args, runner_name=None, exp_id=None):
     if not os.path.exists(model_root_dir):
         os.mkdir(model_root_dir)
 
-    args.model_dir = model_root_dir
-    args.model_path = os.path.join(args.model_dir, 'model.pt')
+    args.model_path = model_root_dir
 
     print(f'Experiment saved to: {args.log_dir}')
 
@@ -111,3 +111,11 @@ class DistributedWeightedSampler(torch.utils.data.distributed.DistributedSampler
 
     def __len__(self):
         return self.num_samples
+
+def str2bool(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')

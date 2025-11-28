@@ -28,7 +28,6 @@ for d in ${!DATASETS[@]}; do
                                 --warmup_teacher_temp_epochs 30 \
                                 --memax_weight 2 \
                                 --transform 'domainnet' \
-                                --weights_path ${WEIGHTS_PATH} \
                                 --lr 0.05 \
                                 --eval_funcs 'v2' \
                                 --src_env ${ENVs1[$e]} \

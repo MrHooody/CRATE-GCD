@@ -12,7 +12,7 @@ from tqdm import tqdm
 from data.augmentations import get_transform
 from data.get_datasets import get_datasets, get_class_splits
 
-from util.general_utils import AverageMeter, init_experiment
+from util.general_utils import AverageMeter, init_experiment, str2bool
 from util.cluster_and_log_utils import log_accs_from_preds
 from config import exp_root, crate_alpha_pretrain_path, ovr_envs, distortions, severity
 from loss import DINOHead, info_nce_logits, SupConLoss, DistillLoss, ContrastiveLearningViewGenerator, get_params_groups
@@ -57,10 +57,10 @@ def train(student, train_loader, optimizer, lr_scheduler, epoch, args):
             sup_con_loss = SupConLoss()(student_proj, labels=sup_con_labels)
 
             pstr = ''
-            pstr += f'cls_loss: {cls_loss.item():.4f} '
-            pstr += f'cluster_loss: {cluster_loss.item():.4f} '
-            pstr += f'sup_con_loss: {sup_con_loss.item():.4f} '
-            pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
+            pstr += f'cls_loss: {cls_loss.item():.4f} | '
+            pstr += f'cluster_loss: {cluster_loss.item():.4f} | '
+            pstr += f'sup_con_loss: {sup_con_loss.item():.4f} | '
+            pstr += f'unsup_con_loss: {contrastive_loss.item():.4f} '
 
             loss = 0
             loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
@@ -78,7 +78,7 @@ def train(student, train_loader, optimizer, lr_scheduler, epoch, args):
             fp16_scaler.update()
 
         if batch_idx % args.print_freq == 0:
-            args.logger.info('Epoch: [{}][{}/{}]\t loss {:.5f}\t {}'
+            args.logger.info('Epoch: [{}][{}/{}] | loss {:.5f} | {}'
                         .format(epoch, batch_idx, len(train_loader), loss.item(), pstr))
 
     args.logger.info('Train Epoch: {} Avg Loss: {:.4f} '.format(epoch, loss_record.avg))
@@ -122,6 +122,10 @@ if __name__ == "__main__":
     parser.add_argument('--task_type', type=str, default='A_L+A_U->B')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
+    parser.add_argument('--pre_splits', type=str2bool, default=False)
+    parser.add_argument('--only_test', type=str2bool, default=False)
+    parser.add_argument('--use_partial_dataset', type=str2bool, default=False)
+    parser.add_argument('--eval_freq', type=int, default=5)
 
     parser.add_argument('--grad_from_block', type=int, default=11)
     parser.add_argument('--lr', type=float, default=0.1)
@@ -140,20 +144,20 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_teacher_temp_epochs', default=30, type=int, help='Number of warmup epochs for the teacher temperature.')
 
     parser.add_argument('--fp16', action='store_true', default=False)
-    parser.add_argument('--print_freq', default=10, type=int)
+    parser.add_argument('--print_freq', default=100, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
 
     # ----------------------
     # INIT
     # ----------------------
     args = parser.parse_args()
-    device = torch.device('cuda:0')
+    device = torch.device('cuda')
     args = get_class_splits(args)
 
     args.num_labeled_classes = len(args.train_classes)
     args.num_unlabeled_classes = len(args.unlabeled_classes)
 
-    init_experiment(args, runner_name=['simgcd'])
+    init_experiment(args, runner_name=['project'])
     args.logger.info(f'Using evaluation function {args.eval_funcs[0]} to print results')
     
     torch.backends.cudnn.benchmark = True
@@ -182,13 +186,19 @@ if __name__ == "__main__":
 
     # Only finetune layers from block 'args.grad_from_block' onwards
     for name, m in backbone.named_parameters():
-        if 'block' in name:
-            block_num = int(name.split('.')[1])
+        if 'layers' in name:
+            block_num = int(name.split('.')[2])
             if block_num >= args.grad_from_block:
                 m.requires_grad = True
 
+    # Double check
+    enabled = set()
+    for name, param in backbone.named_parameters():
+        if param.requires_grad:
+            enabled.add(name)
+    args.logger.info(f"Parameters to be updated: {enabled}")
     
-    args.logger.info('model build')
+    args.logger.info('model built')
 
     # --------------------
     # DATASETS
@@ -233,7 +243,7 @@ if __name__ == "__main__":
     # Sampler which balances labelled and unlabelled examples in each batch
     # --------------------
     label_len = len(train_dataset.labelled_dataset)
-    unlabelled_len = len(train_dataset.unlabelled_dataset)
+    unlabelled_len = len(train_dataset) - label_len
     sample_weights = [1 if i < label_len else label_len / unlabelled_len for i in range(len(train_dataset))]
     sample_weights = torch.DoubleTensor(sample_weights)
     sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset))
@@ -286,11 +296,11 @@ if __name__ == "__main__":
     # ----------------------
     # TRAIN
     # ----------------------
+    best_test_acc, best_train_ul_acc, best_train2_ul_acc = 0, 0, 0
     # train(model, train_loader, test_loader_labelled, test_loader_unlabelled, args)
     for epoch in range(args.epochs):
         args.logger.info(f'Epoch: {epoch}')
-
-        train(model, train_loader, test_loader_A, optimizer, exp_lr_scheduler, epoch, args)
+        train(model, train_loader, optimizer, exp_lr_scheduler, epoch, args)
         
         if epoch % args.eval_freq == 0 or epoch == args.epochs - 1:
             with torch.no_grad():
