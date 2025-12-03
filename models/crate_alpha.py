@@ -101,6 +101,15 @@ class Transformer(nn.Module):
             x = ff(x) + x
         return x 
 
+    def forward_features(self, x, nth_layers):
+        output = []
+        for i, (attn, ff) in enumerate(self.layers):
+            x = attn(x) + x
+            x = ff(x) + x
+            if len(self.layers) - i in nth_layers:
+                output.append(x[:, 0])
+        return output 
+
 class CRATE(nn.Module):
     def __init__(self, *, image_size, patch_size, dim, depth, heads, channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0.):
         super().__init__()
@@ -142,6 +151,22 @@ class CRATE(nn.Module):
         x = self.to_latent(x)
      
         return x
+    
+    def forward_features(self, img, nth_layers):
+        x = self.conv1(img)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+      
+        b, n, _ = x.shape
+
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(n + 1)]
+
+        output = self.transformer.forward_features(x, nth_layers)  
+
+        return output      
 
 
 def CRATE_base():

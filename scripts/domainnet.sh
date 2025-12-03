@@ -33,7 +33,7 @@ for d in ${!DATASETS[@]}; do
                                 --src_env ${ENVs1[$e]} \
                                 --aux_env ${ENVs2[$ee]} \
                                 --task_type ${TASKs[$t]} \
-                                --exp_name 'real-painting'
+                                --exp_name 'real-painting+hilo'
                 else
                     continue
                 fi

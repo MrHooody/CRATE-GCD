@@ -14,57 +14,85 @@ from data.get_datasets import get_datasets, get_class_splits
 
 from util.general_utils import AverageMeter, init_experiment, str2bool
 from util.cluster_and_log_utils import log_accs_from_preds
+from util.faster_mix_k_means_pytorch import K_Means as SemiSupKMeans
 from config import exp_root, crate_alpha_pretrain_path, ovr_envs, distortions, severity
-from loss import DINOHead, info_nce_logits, SupConLoss, DistillLoss, ContrastiveLearningViewGenerator, get_params_groups
+from loss import DINOHead, info_nce_logits, SupConLoss, DistillLoss, ContrastiveLearningViewGenerator, get_params_groups, Distangleloss
 from models.crate_alpha import CRATE_base as crate
 
+def one_axis_loss(axis, header, feats, masked_sup_labels, mask_lab, cluster_criterion, epoch):
+    student_proj, student_out = header(feats)
+    teacher_out = student_out.detach()
 
-def train(student, train_loader, optimizer, lr_scheduler, epoch, args):
+    # clustering, unsup
+    if axis == 'sem':
+        cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
+        avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
+        me_max_loss = - torch.sum(torch.log(avg_probs**(-avg_probs))) + math.log(float(len(avg_probs)))
+        cluster_loss += args.memax_weight * me_max_loss
+
+    elif axis == 'dom':
+        kmeans = SemiSupKMeans(k=student_out.size(-1), tolerance=1e-4, max_iterations=10, init='k-means++',
+                            n_init=10, random_state=None, n_jobs=None, pairwise_batch_size=1024, mode=None)
+
+        kmeans.fit_mix(student_proj[:args.batch_size][~mask_lab], student_proj[:args.batch_size][mask_lab], masked_sup_labels)
+        ps_labels = kmeans.labels_.long()
+        cluster_loss = nn.CrossEntropyLoss()(student_out[:args.batch_size][~mask_lab] / 0.1, ps_labels[:args.batch_size][~mask_lab])
+        avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
+        me_max_loss = - torch.sum(torch.log(avg_probs**(-avg_probs))) + math.log(float(len(avg_probs)))
+        cluster_loss += args.memax_weight_dom * me_max_loss
+
+    # clustering, sup
+    sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
+    sup_labels = torch.cat([masked_sup_labels for _ in range(2)], dim=0)
+    cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
+
+    # representation learning, unsup
+    contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
+    contrastive_loss = nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+
+    # representation learning, sup
+    student_proj1 = torch.cat([f[mask_lab].unsqueeze(1) for f in student_proj.chunk(2)], dim=1)
+    student_proj1 = nn.functional.normalize(student_proj1, dim=-1)
+    sup_con_loss = SupConLoss()(student_proj1, labels=masked_sup_labels)
+    
+    loss = 0
+    loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
+    loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
+
+    return loss, student_proj, student_out
+
+def train(student, dom_head, con_mlp, train_loader, optimizer, lr_scheduler, cluster_criterion, mi_criterion, epoch, args):
 
     loss_record = AverageMeter()
 
     student.train()
-    for batch_idx, batch in enumerate(train_loader):
+    dom_head.train()
+    con_mlp.train()
+    for batch_idx, batch in enumerate(tqdm(train_loader)):
         images, class_labels, uq_idxs, mask_lab = batch
         mask_lab = mask_lab[:, 0]
 
         class_labels, mask_lab = class_labels.cuda(non_blocking=True), mask_lab.cuda(non_blocking=True).bool()
         images = torch.cat(images, dim=0).cuda(non_blocking=True)
+        dom_labels = torch.zeros_like(class_labels[mask_lab]).to(class_labels.device)
 
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            student_proj, student_out = student(images)
-            teacher_out = student_out.detach()
+            feat_list = student[0].forward_features(images, [1, 12])
+            domain_feats = feat_list[0]
+            semantic_feats = feat_list[-1]
+            del feat_list
 
-            # clustering, sup
-            sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
-            sup_labels = torch.cat([class_labels[mask_lab] for _ in range(2)], dim=0)
-            cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
+            sem_loss, sem_proj, sem_out = one_axis_loss('sem', model[1], semantic_feats,
+                                                class_labels[mask_lab], mask_lab, cluster_criterion, epoch)
 
-            # clustering, unsup
-            cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
-            avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
-            me_max_loss = - torch.sum(torch.log(avg_probs**(-avg_probs))) + math.log(float(len(avg_probs)))
-            cluster_loss += args.memax_weight * me_max_loss
+            dom_loss, dom_proj, dom_out = one_axis_loss('dom', dom_head, domain_feats,
+                                                dom_labels, mask_lab, cluster_criterion, epoch)
 
-            # represent learning, unsup
-            contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
-            contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+            # mutual information disentanglement
+            mi_loss = mi_criterion(con_mlp, sem_proj, dom_proj)
 
-            # representation learning, sup
-            student_proj = torch.cat([f[mask_lab].unsqueeze(1) for f in student_proj.chunk(2)], dim=1)
-            student_proj = torch.nn.functional.normalize(student_proj, dim=-1)
-            sup_con_labels = class_labels[mask_lab]
-            sup_con_loss = SupConLoss()(student_proj, labels=sup_con_labels)
+            loss = args.mi_weight * mi_loss + sem_loss + dom_loss
 
-            pstr = ''
-            pstr += f'cls_loss: {cls_loss.item():.4f} | '
-            pstr += f'cluster_loss: {cluster_loss.item():.4f} | '
-            pstr += f'sup_con_loss: {sup_con_loss.item():.4f} | '
-            pstr += f'unsup_con_loss: {contrastive_loss.item():.4f} '
-
-            loss = 0
-            loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
-            loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
             
         # Train acc
         loss_record.update(loss.item(), class_labels.size(0))
@@ -76,10 +104,6 @@ def train(student, train_loader, optimizer, lr_scheduler, epoch, args):
             fp16_scaler.scale(loss).backward()
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
-
-        if batch_idx % args.print_freq == 0:
-            args.logger.info('Epoch: [{}][{}/{}] | loss {:.5f} | {}'
-                        .format(epoch, batch_idx, len(train_loader), loss.item(), pstr))
 
     args.logger.info('Train Epoch: {} Avg Loss: {:.4f} '.format(epoch, loss_record.avg))
     lr_scheduler.step()
@@ -139,13 +163,17 @@ if __name__ == "__main__":
     parser.add_argument('--n_views', default=2, type=int)
     
     parser.add_argument('--memax_weight', type=float, default=2)
+    parser.add_argument('--memax_weight_dom', type=float, default=0.1)
     parser.add_argument('--warmup_teacher_temp', default=0.07, type=float, help='Initial value for the teacher temperature.')
     parser.add_argument('--teacher_temp', default=0.04, type=float, help='Final value (after linear warmup)of the teacher temperature.')
     parser.add_argument('--warmup_teacher_temp_epochs', default=30, type=int, help='Number of warmup epochs for the teacher temperature.')
 
-    parser.add_argument('--fp16', action='store_true', default=False)
+    parser.add_argument('--fp16', action='store_true', default=True)
     parser.add_argument('--print_freq', default=100, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
+
+    parser.add_argument('--model', default='crate', type=str, help='crate|vit')
+    parser.add_argument('--mi_weight', default=0.5)
 
     # ----------------------
     # INIT
@@ -262,12 +290,15 @@ if __name__ == "__main__":
     # PROJECTION HEAD
     # ----------------------
     projector = DINOHead(in_dim=args.feat_dim, out_dim=args.mlp_out_dim, nlayers=args.num_mlp_layers)
+    dom_head = DINOHead(in_dim=args.feat_dim, out_dim=2, nlayers=args.num_mlp_layers).to(device)
+    con_mlp = DINOHead(in_dim=256*2, out_dim=1).to(device)
+
     model = nn.Sequential(backbone, projector).to(device)
 
     # ----------------------
     # OPITMIZATION
     # ----------------------   
-    params_groups = get_params_groups(model)
+    params_groups = get_params_groups(model) + get_params_groups(dom_head) + get_params_groups(con_mlp)
     optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     fp16_scaler = None
     if args.fp16:
@@ -285,6 +316,8 @@ if __name__ == "__main__":
                         args.warmup_teacher_temp,
                         args.teacher_temp,
                     )
+    
+    mi_criterion = Distangleloss(device)
 
     # # inductive
     # best_test_acc_lab = 0
@@ -300,7 +333,7 @@ if __name__ == "__main__":
     # train(model, train_loader, test_loader_labelled, test_loader_unlabelled, args)
     for epoch in range(args.epochs):
         args.logger.info(f'Epoch: {epoch}')
-        train(model, train_loader, optimizer, exp_lr_scheduler, epoch, args)
+        train(model, dom_head, con_mlp, train_loader, optimizer, exp_lr_scheduler, cluster_criterion, mi_criterion, epoch, args)
         
         if epoch % args.eval_freq == 0 or epoch == args.epochs - 1:
             with torch.no_grad():
@@ -310,6 +343,7 @@ if __name__ == "__main__":
                 if all_acc > best_train_ul_acc:
                     args.logger.info('Best Train Accuracies: All {:.4f} | Old {:.4f} | New {:.4f}'.format(all_acc, old_acc, new_acc))
                     torch.save(model.state_dict(), os.path.join(args.model_path, 'best_trainul.pt'))
+                    torch.save(dom_head.state_dict(), os.path.join(args.model_path, 'dom_head.pt'))
                     best_train_ul_acc = all_acc
 
                 # Testing on unlabelled examples in domain B, if domain B exists

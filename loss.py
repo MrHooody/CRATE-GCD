@@ -229,3 +229,34 @@ class DistillLoss(nn.Module):
                 n_loss_terms += 1
         total_loss /= n_loss_terms
         return total_loss
+
+class Distangleloss(nn.Module):
+    """Loss function to extract semantic information and substract exclusive information from images, using mutual information"""
+
+    def __init__(self, device):
+        super(Distangleloss, self).__init__()
+        self.device = device
+
+    def js_fgan_lower_bound(self, score_matrix):
+        """Lower bound on Jensen-Shannon divergence from Nowozin et al. (2016)."""
+        f_diag = score_matrix.diag()
+        first_term = -F.softplus(-f_diag).mean()
+        n = score_matrix.size(0)
+        second_term = (torch.sum(F.softplus(score_matrix)) -
+                    torch.sum(F.softplus(f_diag))) / (n * (n - 1.))
+        return first_term - second_term
+
+    def forward(self, mlp_head, x, y):
+        batch_size = x.size(0)
+        # Tile all possible combinations of x and y
+        x_tiled = torch.stack([x] * batch_size, dim=0)
+        y_tiled = torch.stack([y] * batch_size, dim=1)
+        # xy is [batch_size * batch_size, x_dim + y_dim]
+        xy_pairs = torch.reshape(torch.cat((x_tiled, y_tiled), dim=2), [
+                                 batch_size * batch_size, -1])
+        # Compute scores for each x_i, y_j pair.
+        _, scores = mlp_head(xy_pairs)
+        similarity_matrix = torch.reshape(scores, [batch_size, batch_size]).t()
+        loss = self.js_fgan_lower_bound(similarity_matrix)
+        
+        return loss

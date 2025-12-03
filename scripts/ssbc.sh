@@ -2,18 +2,13 @@
 PYTHON="/home/hpo/anaconda3/envs/hilo/bin/python3"
 export CUDA_VISIBLE_DEVICES=${1}
 
-model='dino'
-
 DATASETS=("cubc")
 TASKs=("A_L+A_U+B->A_U+B+C")
-
-SAVE_DIR=/home/hpo/Documents/HiLo/logs/
-WEIGHTS_PATH=/home/hpo/Documents/HiLo/data/sample_weights/ssbc/cubc.json
 
 for d in ${!DATASETS[@]}; do
     for t in ${!TASKs[@]}; do
         echo ${DATASETS[$d]}
-        ${PYTHON} -m methods.ours.mi_dis_pm \
+        ${PYTHON} -m train \
                     --dataset_name ${DATASETS[$d]} \
                     --batch_size 150 \
                     --grad_from_block 11 \
@@ -26,14 +21,12 @@ for d in ${!DATASETS[@]}; do
                     --warmup_teacher_temp_epochs 30 \
                     --memax_weight 2 \
                     --transform 'imagenet' \
-                    --weights_path ${WEIGHTS_PATH} \
                     --lr 0.05 \
                     --eval_funcs 'v2' \
                     --src_env 'N/A' \
                     --tgt_env 'N/A' \
                     --aux_env 'N/A' \
                     --task_type ${TASKs[$t]} \
-                    --model ${model} \
-                    --model_path ${SAVE_DIR}${DATASETS[$d]}
+                    --exp_name 'cubc+hilo'
     done
 done
